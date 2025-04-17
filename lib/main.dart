@@ -311,7 +311,7 @@ class _SoundManagerScreenState extends State<SoundManagerScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('ניהול הצלילים'),
+        title: const Text('!ניהול הצלילים'),
         centerTitle: true,
         backgroundColor: Colors.transparent,
         foregroundColor: Colors.black87,
