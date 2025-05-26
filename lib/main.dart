@@ -1,10 +1,11 @@
-// תיקון קריסה כשמתנגנים מספר צלילים: נוסיף המתנה לכל פעולת stop+dispose
-
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/services.dart' show rootBundle;
+import '../widgets/sound_tile.dart';
+import 'package:flutter/foundation.dart';
 
 void main() {
   runApp(const MainApp());
@@ -36,23 +37,8 @@ class MainScreen extends StatefulWidget {
 
 class _MainScreenState extends State<MainScreen> {
   int _selectedIndex = 0;
-  final GlobalKey<_SoundBoardScreenState> _soundBoardKey = GlobalKey();
 
-  Widget _getPage(int index) {
-    switch (index) {
-      case 0:
-        return SoundBoardScreen(key: _soundBoardKey);
-      case 1:
-        return const SoundManagerScreen();
-      default:
-        return const SizedBox.shrink();
-    }
-  }
-
-  void _onItemTapped(int index) async {
-    if (_selectedIndex == 0) {
-      await _soundBoardKey.currentState?.stopAllSounds();
-    }
+  void _onItemTapped(int index) {
     setState(() {
       _selectedIndex = index;
     });
@@ -60,8 +46,13 @@ class _MainScreenState extends State<MainScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final screens = [
+      const SoundBoardScreen(),
+      const SoundManagerScreen(),
+    ];
+
     return Scaffold(
-      body: _getPage(_selectedIndex),
+      body: screens[_selectedIndex],
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: _selectedIndex,
         onTap: _onItemTapped,
@@ -89,58 +80,17 @@ class SoundBoardScreen extends StatefulWidget {
 }
 
 class _SoundBoardScreenState extends State<SoundBoardScreen> {
-  List<String> selectedFiles = [];
-  final Map<String, AudioPlayer> _players = {};
+  late Future<List<String>> _selectedFilesFuture;
+
+  Future<List<String>> _loadSelectedSounds() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getStringList('selected_sounds') ?? [];
+  }
 
   @override
   void initState() {
     super.initState();
-    _loadSelectedSounds();
-  }
-
-  Future<void> stopAllSounds() async {
-    final futures = _players.values.map((player) async {
-      try {
-        await player.stop();
-        await player.dispose();
-      } catch (_) {}
-    });
-    await Future.wait(futures);
-    _players.clear();
-  }
-
-  @override
-  void dispose() {
-    stopAllSounds();
-    super.dispose();
-  }
-
-  Future<void> _loadSelectedSounds() async {
-    final prefs = await SharedPreferences.getInstance();
-    setState(() {
-      selectedFiles = prefs.getStringList('selected_sounds') ?? [];
-    });
-  }
-
-  void _onSoundPressed(String file) async {
-    if (_players.containsKey(file)) {
-      await _players[file]?.stop();
-      await _players[file]?.dispose();
-      setState(() {
-        _players.remove(file);
-      });
-    } else {
-      final player = AudioPlayer();
-      await player.play(AssetSource('sounds/$file'));
-      setState(() {
-        _players[file] = player;
-      });
-      player.onPlayerComplete.listen((event) {
-        setState(() {
-          _players.remove(file);
-        });
-      });
-    }
+    _selectedFilesFuture = _loadSelectedSounds();
   }
 
   @override
@@ -153,34 +103,40 @@ class _SoundBoardScreenState extends State<SoundBoardScreen> {
         foregroundColor: Colors.black87,
         elevation: 0,
       ),
-      body: selectedFiles.isEmpty
-          ? const Center(child: Text('כאן תוצג רשימת הצלילים'))
-          : GridView.count(
+      body: FutureBuilder<List<String>>(
+        future: _selectedFilesFuture,
+        builder: (context, snapshot) {
+          if (!snapshot.hasData) {
+            return const Center(child: CircularProgressIndicator());
+          }
+
+          final selectedFiles = snapshot.data!;
+          if (selectedFiles.isEmpty) {
+            return const Center(child: Text('כאן תוצג רשימת הצלילים'));
+          }
+
+          return GridView.builder(
+            padding: const EdgeInsets.all(16),
+            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
               crossAxisCount: 2,
-              padding: const EdgeInsets.all(16),
               crossAxisSpacing: 16,
               mainAxisSpacing: 16,
-              children: selectedFiles.map((file) {
-                final name = file.replaceAll('.wav', '').replaceAll('.mp3', '');
-                final isPlaying = _players.containsKey(file);
-
-                return GestureDetector(
-                  onTap: () => _onSoundPressed(file),
-                  child: Container(
-                    padding: const EdgeInsets.all(24),
-                    decoration: BoxDecoration(
-                      color: isPlaying ? Colors.red[300] : Colors.grey[200],
-                      shape: BoxShape.circle,
-                    ),
-                    child: Center(
-                      child: isPlaying
-                          ? const Icon(Icons.pause, size: 30, color: Colors.white)
-                          : Text(name, textAlign: TextAlign.center),
-                    ),
-                  ),
-                );
-              }).toList(),
             ),
+            itemCount: selectedFiles.length,
+            itemBuilder: (context, index) {
+              final fileName = selectedFiles[index];
+              final displayName = fileName
+                  .replaceAll('.wav', '')
+                  .replaceAll('.mp3', '');
+
+              return WaveSoundTileLight(
+                fileName: fileName,
+                displayName: displayName,
+              );
+            },
+          );
+        },
+      ),
     );
   }
 }
@@ -193,6 +149,7 @@ class SoundManagerScreen extends StatefulWidget {
 }
 
 class _SoundManagerScreenState extends State<SoundManagerScreen> {
+  late SharedPreferences _prefs;
   List<String> allFiles = [];
   List<String> selectedFiles = [];
   String query = '';
@@ -200,99 +157,90 @@ class _SoundManagerScreenState extends State<SoundManagerScreen> {
   Map<String, List<String>> soundTags = {};
   AudioPlayer? _singlePlayer;
   String? _currentlyPlaying;
+  Timer? _debounce;
 
   @override
   void initState() {
     super.initState();
-    _loadSoundFiles();
-    _loadSelectedSounds();
-    _loadSoundTags();
-    generateSoundMetadataJson().then(print);
+    _init();
   }
 
-  @override
-  void dispose() {
-    _searchController.dispose();
-    _singlePlayer?.stop();
-    _singlePlayer?.dispose();
-    super.dispose();
+  Future<void> _init() async {
+    _prefs = await SharedPreferences.getInstance();
+    await _loadSoundFiles();
+    await _loadSelectedSounds();
+    await _loadSoundTags();
   }
 
   Future<void> _loadSoundFiles() async {
     final manifestContent = await rootBundle.loadString('AssetManifest.json');
     final Map<String, dynamic> manifestMap = json.decode(manifestContent);
     final files = manifestMap.keys
-        .where((path) => path.startsWith('assets/sounds/') &&
+        .where((path) =>
+            path.startsWith('assets/sounds/') &&
             (path.endsWith('.wav') || path.endsWith('.mp3')))
         .map((path) => path.split('/').last)
         .toList();
-
     setState(() {
       allFiles = files;
     });
   }
 
   Future<void> _loadSelectedSounds() async {
-    final prefs = await SharedPreferences.getInstance();
-    setState(() {
-      selectedFiles = prefs.getStringList('selected_sounds') ?? [];
-    });
+    final list = _prefs.getStringList('selected_sounds') ?? [];
+    if (!listEquals(selectedFiles, list)) {
+      setState(() {
+        selectedFiles = list;
+      });
+    }
   }
 
   Future<void> _loadSoundTags() async {
-    final jsonString = await rootBundle.loadString('assets/data/sound_metadata.json');
+    final jsonString =
+        await rootBundle.loadString('assets/data/sound_metadata.json');
     final Map<String, dynamic> jsonMap = json.decode(jsonString);
     setState(() {
-      soundTags = jsonMap.map((key, value) => MapEntry(key, List<String>.from(value)));
+      soundTags =
+          jsonMap.map((key, value) => MapEntry(key, List<String>.from(value)));
     });
-  }
-
-  Future<String> generateSoundMetadataJson() async {
-    final manifestContent = await rootBundle.loadString('AssetManifest.json');
-    final Map<String, dynamic> manifestMap = json.decode(manifestContent);
-    final files = manifestMap.keys
-        .where((path) => path.startsWith('assets/sounds/') &&
-            (path.endsWith('.wav') || path.endsWith('.mp3')))
-        .map((path) => path.split('/').last)
-        .toList();
-
-    final metadata = { for (var file in files) file: [] };
-    return const JsonEncoder.withIndent('  ').convert(metadata);
   }
 
   Future<void> _toggleSelection(String file) async {
-    final prefs = await SharedPreferences.getInstance();
-    setState(() {
-      if (selectedFiles.contains(file)) {
-        selectedFiles.remove(file);
-      } else if (selectedFiles.length < 6) {
-        selectedFiles.add(file);
-      }
+    if (selectedFiles.contains(file)) {
+      selectedFiles.remove(file);
+    } else if (selectedFiles.length < 6) {
+      selectedFiles.add(file);
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('ניתן לבחור עד 6 צלילים בלבד')),
+      );
+      return;
+    }
+    setState(() {});
+    await _prefs.setStringList('selected_sounds', selectedFiles);
+  }
+
+  void _onSearchChanged(String value) {
+    if (_debounce?.isActive ?? false) _debounce!.cancel();
+    _debounce = Timer(const Duration(milliseconds: 300), () {
+      setState(() {
+        query = value;
+      });
     });
-    await prefs.setStringList('selected_sounds', selectedFiles);
   }
 
   void _onSoundPressed(String file) async {
     if (_currentlyPlaying == file) {
-      await _singlePlayer?.stop();
-      await _singlePlayer?.dispose();
-      setState(() {
-        _currentlyPlaying = null;
-        _singlePlayer = null;
-      });
+      await _stopAndDisposeSinglePlayer();
     } else {
-      await _singlePlayer?.stop();
-      await _singlePlayer?.dispose();
-
+      await _stopAndDisposeSinglePlayer();
       final player = AudioPlayer();
       await player.play(AssetSource('sounds/$file'));
-
       setState(() {
         _currentlyPlaying = file;
         _singlePlayer = player;
       });
-
-      player.onPlayerComplete.listen((event) {
+      player.onPlayerComplete.listen((_) {
         setState(() {
           _currentlyPlaying = null;
           _singlePlayer = null;
@@ -301,12 +249,31 @@ class _SoundManagerScreenState extends State<SoundManagerScreen> {
     }
   }
 
+  Future<void> _stopAndDisposeSinglePlayer() async {
+    try {
+      await _singlePlayer?.stop();
+      await _singlePlayer?.release();
+      await _singlePlayer?.dispose();
+    } catch (_) {}
+    _singlePlayer = null;
+    _currentlyPlaying = null;
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    _stopAndDisposeSinglePlayer();
+    _debounce?.cancel();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
     final filteredFiles = allFiles.where((file) {
       final name = file.toLowerCase();
       final tags = soundTags[file]?.join(' ').toLowerCase() ?? '';
-      return name.contains(query.toLowerCase()) || tags.contains(query.toLowerCase());
+      return name.contains(query.toLowerCase()) ||
+          tags.contains(query.toLowerCase());
     }).toList();
 
     return Scaffold(
@@ -327,36 +294,42 @@ class _SoundManagerScreenState extends State<SoundManagerScreen> {
                 labelText: 'חיפוש לפי שם או תיוג',
                 border: OutlineInputBorder(),
               ),
-              onChanged: (value) => setState(() => query = value),
+              onChanged: _onSearchChanged,
             ),
           ),
           Expanded(
             child: filteredFiles.isEmpty
                 ? const Center(child: Text('לא נמצאו צלילים תואמים'))
-                : ListView(
-                    children: filteredFiles.map((file) {
-                      final name = file.replaceAll('.wav', '').replaceAll('.mp3', '');
+                : ListView.builder(
+                    itemCount: filteredFiles.length,
+                    itemBuilder: (context, index) {
+                      final file = filteredFiles[index];
+                      final name = file
+                          .replaceAll('.wav', '')
+                          .replaceAll('.mp3', '');
                       final isSelected = selectedFiles.contains(file);
                       final tags = soundTags[file] ?? [];
                       final isPlaying = _currentlyPlaying == file;
 
                       return ListTile(
                         leading: IconButton(
-                          icon: Icon(isPlaying ? Icons.pause : Icons.volume_up),
+                          icon: Icon(
+                              isPlaying ? Icons.pause : Icons.volume_up),
                           onPressed: () => _onSoundPressed(file),
                         ),
                         title: Text(name, textAlign: TextAlign.right),
                         subtitle: Wrap(
                           spacing: 8,
                           alignment: WrapAlignment.end,
-                          children: tags.map((tag) => Chip(label: Text(tag))).toList(),
+                          children:
+                              tags.map((tag) => Chip(label: Text(tag))).toList(),
                         ),
                         trailing: Checkbox(
                           value: isSelected,
                           onChanged: (_) => _toggleSelection(file),
                         ),
                       );
-                    }).toList(),
+                    },
                   ),
           ),
         ],
